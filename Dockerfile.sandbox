@@ -1,0 +1,58 @@
+# Adapted OpenClaw image for the egress-restricted cloud sandbox.
+# Substitutes for ghcr.io/openclaw/openclaw:latest, which is unreachable here
+# (all container registries blocked by the sandbox proxy — see SETUP_NOTES.md).
+#
+# Deviations from the official image, on record for audit fidelity:
+#   1. Base = snapshot of the sandbox's Ubuntu 24.04 rootfs (docker import),
+#      NOT node:24-bookworm-slim pinned by digest.
+#   2. node 24.16.0 obtained from PyPI (nodejs-wheel-binaries — the only
+#      allowlisted source shipping node >= the enforced 24.15.0/22.22.3 floor;
+#      sandbox node 22.22.2 is rejected by OpenClaw's runtime guard).
+#   3. OpenClaw installed from the npm registry (openclaw@2026.7.1-2, the
+#      "latest" dist-tag at install time), not from the repo's multi-stage
+#      Dockerfile build. The npm package ships the same dist/ tree.
+#   4. NODE_EXTRA_CA_CERTS points at the system CA store because sandbox
+#      egress is TLS-intercepted. Unnecessary on a normal host.
+# Matched to official: non-root node user uid/gid 1000, HOME=/home/node,
+# WORKDIR containing dist/index.js (so the stock docker-compose.yml command
+# and healthcheck work unmodified), init via compose `init: true`.
+
+FROM sandbox-base:ubuntu24
+
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+
+# Non-root runtime user, uid 1000 to match the official image ("node").
+# (the imported rootfs already has a gid/uid 1000 from the sandbox — rename it)
+RUN (getent group 1000 >/dev/null && groupmod -n node "$(getent group 1000 | cut -d: -f1)" || groupadd -g 1000 node) && \
+    (getent passwd 1000 >/dev/null && usermod -l node -d /home/node -s /bin/bash "$(getent passwd 1000 | cut -d: -f1)" || useradd -m -u 1000 -g 1000 -s /bin/bash node) && \
+    mkdir -p /home/node/.openclaw/workspace /home/node/.config/openclaw && \
+    chown -R node:node /home/node && \
+    mkdir -p /tmp && chmod 1777 /tmp
+
+# node 24.16.0 from PyPI wheel; expose ahead of the sandbox's node 22.
+# (the sandbox rootfs pre-seeds /usr/local/bin/node→node22 symlinks — replace
+# them; npm/npx get exec wrappers because the wheel flattens npm's bin symlinks,
+# breaking their relative require when invoked through another symlink)
+RUN pip install --break-system-packages nodejs-wheel-binaries==24.16.0 && \
+    NW="$(python3 -c 'import nodejs_wheel, os; print(os.path.dirname(nodejs_wheel.__file__))')" && \
+    ln -sfn "$NW/bin/node" /usr/local/bin/node && \
+    printf '#!/bin/sh\nexec /usr/local/bin/node %s/lib/node_modules/npm/bin/npm-cli.js "$@"\n' "$NW" > /usr/local/bin/npm && \
+    printf '#!/bin/sh\nexec /usr/local/bin/node %s/lib/node_modules/npm/bin/npx-cli.js "$@"\n' "$NW" > /usr/local/bin/npx && \
+    chmod 755 /usr/local/bin/npm /usr/local/bin/npx && \
+    /usr/local/bin/node --version && /usr/local/bin/npm --version
+
+ENV PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# OpenClaw from npm, version pinned; global prefix set to /usr/local so the
+# app lands at /usr/local/lib/node_modules/openclaw.
+RUN npm config set -g prefix /usr/local cache /tmp/.npm && \
+    npm install -g openclaw@2026.7.1-2 && \
+    test -f /usr/local/lib/node_modules/openclaw/dist/index.js
+
+# Stock compose runs: node dist/index.js gateway ... (relative path) and
+# healthcheck node dist/docker-healthcheck.js — both resolve from WORKDIR.
+WORKDIR /usr/local/lib/node_modules/openclaw
+
+ENV HOME=/home/node
+USER node

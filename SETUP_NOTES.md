@@ -61,4 +61,158 @@ git init -b main
 # wrote SETUP_NOTES.md (this file)
 ```
 
-*(log continues below as work proceeds)*
+```bash
+# 2. Clone official repo (shallow), pin commit
+git clone --depth 1 https://github.com/openclaw/openclaw.git openclaw
+# pinned commit: 18163ba269c375b92a390a0f03ef20fdfa24dc13
+# read scripts/docker/setup.sh (994 lines) + docker-compose.yml BEFORE running
+
+# 3. Official setup script, pre-built image, state redirected into lab dir
+export OPENCLAW_IMAGE="ghcr.io/openclaw/openclaw:latest"
+export OPENCLAW_CONFIG_DIR="$HOME/Projects/openclaw-lab/state/openclaw"
+export OPENCLAW_WORKSPACE_DIR="$HOME/Projects/openclaw-lab/state/openclaw/workspace"
+export OPENCLAW_AUTH_PROFILE_SECRET_DIR="$HOME/Projects/openclaw-lab/state/openclaw-auth-profile-secrets"
+export OPENCLAW_SKIP_ONBOARDING=1   # headless; onboarding done separately per docs
+./scripts/docker/setup.sh
+# → FAILED: ghcr.io 403 Forbidden
+# retry with official Docker Hub mirror openclaw/openclaw:latest → 403
+# control test: docker pull alpine:latest → 403  ⇒ not an OpenClaw problem
+```
+
+## Surprise #1 — sandbox egress blocks ALL container registries
+
+The cloud sandbox routes egress through an allowlist proxy. Allowed:
+registry.npmjs.org, pypi.org, crates.io, proxy.golang.org, jsr.io, anthropic.com.
+Blocked (403 at proxy): ghcr.io, registry-1.docker.io, quay.io, public.ecr.aws,
+deb.debian.org, nodejs.org, download.docker.com.
+
+Consequences:
+- No pre-built OpenClaw image, and no local build either (official Dockerfile
+  is `FROM docker.io/library/node:24-bookworm…` — base unreachable).
+- `apt-get` cannot install anything new.
+- OpenClaw IS reachable via npm (`openclaw@2026.7.1-2`, dist-tag `latest`).
+
+## Surprise #2 — node version off by one patch
+
+Repo and npm package both require `node >=22.22.3 <23 || >=24.15.0 <25`.
+Sandbox has node 22.22.2 (also /opt/node20, /opt/node21 — no 24; nodejs.org
+blocked so no upgrade path). One patch below the floor → npm warns; runtime
+behavior to be verified. Audit note: OpenClaw pins engines tightly and the
+Dockerfile pins base images by SHA256 digest — good supply-chain hygiene,
+inconvenient for constrained environments.
+
+**Setup script observation (audit-relevant):** `setup.sh` wrote `.env`
+containing a generated `OPENCLAW_GATEWAY_TOKEN` into the repo root on its
+FIRST failed run ("Reusing gateway token from …/.env" on the second run) —
+i.e., secrets exist on disk before the install even succeeds. `.env` is
+git-ignored upstream, but it demonstrates that a failed install still leaves
+credentials behind.
+
+## Decision #5 — Adapted Docker path (Joanna-approved)
+
+Native fallback was offered per the 45-minute tripwire; Joanna chose Docker
+with an adapted image. Construction (all logged in `Dockerfile.sandbox`):
+
+```bash
+# 4. Base image from the sandbox's own rootfs (registries unreachable)
+tar -cf - usr bin sbin lib lib64 etc opt/node22 var \
+  --exclude=<go,jvm,docs,man,docker-state,apt-state,caches> \
+  | docker import -c 'ENV PATH=...' - sandbox-base:ubuntu24   # 2.46 GB, ~6 min
+
+# 5. Adapted app image — see Dockerfile.sandbox for full rationale
+docker build -f Dockerfile.sandbox -t openclaw:sandbox .
+```
+
+Build iterations (surprises #3–#6, each cost one rebuild):
+
+1. **gid/uid 1000 already taken** in the imported rootfs (sandbox's `ubuntu`
+   user) → renamed to `node` rather than creating fresh.
+2. **TLS interception**: npm-in-container failed `SELF_SIGNED_CERT_IN_CHAIN`;
+   sandbox egress is MITM'd. Fix: `NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt`
+   (system store contains the proxy CAs). Needed at runtime too — the gateway's
+   Anthropic API calls go through the same interception.
+3. **npm prefix hijack**: sandbox npmrc pinned `prefix=/home/claude/.npm-global`,
+   silently relocating the "global" install. Reset in image. Audit lesson:
+   *where openclaw lands depends on npmrc state, not just the install command.*
+4. **Runtime node-version guard is a hard wall**: OpenClaw's `runtime-guard`
+   refuses node 22.22.2 (needs ≥22.22.3). Not bypassable by flag (by design —
+   good). Fix: node 24.16.0 from PyPI `nodejs-wheel-binaries` (the only
+   allowlisted source with a new-enough node), wired ahead of node22 with
+   exec wrappers (the wheel flattens npm's bin symlinks; naive symlinking
+   breaks npm's relative `require`).
+
+```bash
+# 6. Official setup script again, offline mode, adapted image
+export OPENCLAW_IMAGE="openclaw:sandbox"   # + same state-dir exports as step 3
+./scripts/docker/setup.sh --offline
+# exit=0 — gateway container up
+curl http://127.0.0.1:18789/healthz   # → 200
+# gateway log: "http server listening", "ready"; 8 plugins; log file INSIDE
+# container at /tmp/openclaw-1000/openclaw-<date>.log (tmpfs-ish, not mounted!)
+# default agent model pre-onboarding: openai/gpt-5.5 (interesting default)
+```
+
+## Onboarding + first agent (commands verbatim)
+
+```bash
+# 7. API key into the official secrets file (Joanna supplied key in chat)
+printf 'ANTHROPIC_API_KEY=<redacted>\n' >> openclaw/.env && chmod 600 openclaw/.env
+
+# 8. Official headless onboarding (exact command from docs/install/docker.md,
+#    with --auth-choice anthropic-api-key per docs + source)
+docker compose run -T --rm --no-deps --entrypoint node openclaw-gateway \
+  dist/index.js onboard --non-interactive --accept-risk --skip-health \
+  --mode local --auth-choice anthropic-api-key --secret-input-mode ref \
+  --gateway-auth token --gateway-token-ref-env OPENCLAW_GATEWAY_TOKEN \
+  --skip-channels --no-install-daemon
+# → "Updated config", workspace + sessions OK
+
+# 9. SURPRISE #7: onboarding stored the auth ref but left the default model
+#    as openai/gpt-5.5 (with no OpenAI auth!). `models status` showed
+#    anthropic resolving fine from env. Fixed with the official CLI:
+docker compose run -T --rm openclaw-cli models set anthropic/claude-sonnet-5
+docker compose restart openclaw-gateway
+# gateway log: "agent model: anthropic/claude-sonnet-5 (thinking=high)"
+
+# 10. END-TO-END TEST (definition of done)
+docker compose run -T --rm openclaw-cli agent --agent main \
+  -m "Hello! Reply with one sentence confirming which model you are and that
+      you received this via the OpenClaw gateway."
+# → "I'm Claude Sonnet 5 (anthropic/claude-sonnet-5), and I've received this
+#    message via the OpenClaw gateway."   ✅
+```
+
+Note for step 10: bare `openclaw agent -m ...` errors with "No target session
+selected" — `--agent main` (or a session key) is required.
+
+## Where the API key ended up (verified)
+
+- `openclaw/.env` (root:root, mode 600) — the only plaintext copy on disk.
+- `openclaw.json` and the state tree contain only env *references*
+  (`--secret-input-mode ref` behaved as documented).
+- Standard Docker caveat: the key is visible in the container's process
+  environment (`docker inspect`) to anyone with Docker daemon access.
+
+## Remaining surprises for the audit file
+
+- Compose starts the gateway with `--bind lan`, overriding the
+  `gateway.bind: loopback` that onboarding writes. Ports publish on 0.0.0.0.
+  The gateway itself warns about it. Full detail in DEPLOYMENT_MAP.md.
+- Runtime log lives in container /tmp — not persisted. Only
+  `logs/config-audit.jsonl` and session transcripts survive on the host.
+- MS Teams port 3978 is published even with no channel configured.
+- OpenClaw git-inits its workspace and writes persona/memory markdown files
+  (SOUL.md, IDENTITY.md, …) on first onboarding — session-memory hook enabled
+  by default.
+
+## Definition of done — status
+
+| Item | Status |
+|---|---|
+| Container running | ✅ `openclaw-openclaw-gateway-1` healthy, /healthz 200 |
+| One agent responding via Claude | ✅ `main` → claude-sonnet-5, e2e verified |
+| SETUP_NOTES.md | ✅ this file |
+| DEPLOYMENT_MAP.md | ✅ written from live inspection |
+| Everything committed, no secrets | ✅ see git log; `git status` clean; state/ + .env ignored |
+| No extra agents built | ✅ deliberately stopped at one |
+
