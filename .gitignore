@@ -1,0 +1,22 @@
+# ── Secrets ──────────────────────────────────────────────
+# Compose .env holds ANTHROPIC_API_KEY and OPENCLAW_GATEWAY_TOKEN
+.env
+*.env
+!.env.example
+**/auth-profiles.json
+**/identity/
+**/*.key
+**/*.pem
+**/secrets/
+
+# ── OpenClaw runtime state (not source, not audit docs) ──
+# All container bind-mount state is kept under state/ in this repo
+state/
+
+# ── Upstream source clone (reproducible; commit hash pinned in SETUP_NOTES.md)
+openclaw/
+
+# ── OS / editor noise ────────────────────────────────────
+.DS_Store
+*.log
+node_modules/
