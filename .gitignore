@@ -20,3 +20,7 @@ openclaw/
 .DS_Store
 *.log
 node_modules/
+
+# Working notes stay local, never in the repository
+plans/
+docs/plans/

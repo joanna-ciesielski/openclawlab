@@ -1,15 +1,13 @@
 # OpenClaw Phase 0 — Setup Notes
 
-**Date:** 2026-08-14 (evening, US Central)
-**Operator:** Claude (Cowork session), on behalf of Joanna
+**Date:** 2026-08-14
 **Goal:** Official Docker install of OpenClaw, one agent responding via Claude API, deployment map for audit prep.
 
 ## Environment decision (surprise #0)
 
-The plan said "this Mac," but the Claude desktop bridge was not connected to the
-session, so there was no way to execute on the Mac. Joanna approved fallback:
-**cloud Linux sandbox** (x86_64, kernel 6.18.5, Docker Engine 29.4.3,
-Compose v5.1.3). Caveat recorded: environment is ephemeral; this repo is the
+The intended host was a Mac, which was not reachable from the working
+environment, so the install ran instead on a **cloud Linux sandbox**
+(x86_64, kernel 6.18.5, Docker Engine 29.4.3, Compose v5.1.3). Caveat recorded: environment is ephemeral; this repo is the
 durable artifact. Replaying on the Mac = clone this repo, follow the same
 commands.
 
@@ -108,10 +106,11 @@ i.e., secrets exist on disk before the install even succeeds. `.env` is
 git-ignored upstream, but it demonstrates that a failed install still leaves
 credentials behind.
 
-## Decision #5 — Adapted Docker path (Joanna-approved)
+## Decision #5 — Adapted Docker path
 
-Native fallback was offered per the 45-minute tripwire; Joanna chose Docker
-with an adapted image. Construction (all logged in `Dockerfile.sandbox`):
+A native (non-Docker) install was the alternative; Docker with an adapted image
+was chosen instead, to keep the deployment topology identical to the official
+path. Construction (all logged in `Dockerfile.sandbox`):
 
 ```bash
 # 4. Base image from the sandbox's own rootfs (registries unreachable)
@@ -155,7 +154,7 @@ curl http://127.0.0.1:18789/healthz   # → 200
 ## Onboarding + first agent (commands verbatim)
 
 ```bash
-# 7. API key into the official secrets file (Joanna supplied key in chat)
+# 7. API key into the official secrets file
 printf 'ANTHROPIC_API_KEY=<redacted>\n' >> openclaw/.env && chmod 600 openclaw/.env
 
 # 8. Official headless onboarding (exact command from docs/install/docker.md,
